@@ -1,14 +1,22 @@
-name: win 11 + tailscale + Download.bat script 
+name: win2025 server
 
 on:
   workflow_dispatch:
 
 jobs:
   secure-rdp:
+    # GitHub-hosted Windows Server 2025 image (was: windows-2022 / typo "windows-20252")
     runs-on: windows-2025
     timeout-minutes: 350
 
     steps:
+      - name: Show Runner OS
+        run: |
+          Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          Write-Host "Version: $((Get-CimInstance Win32_OperatingSystem).Version)"
+          Write-Host "Build: $((Get-CimInstance Win32_OperatingSystem).BuildNumber)"
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+
       - name: Configure Core RDP Settings
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
@@ -16,18 +24,28 @@ jobs:
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
+
+          # Server 2025: the legacy "RDP Security Layer" (0) is deprecated/weak.
+          # Use TLS (2) so non-NLA clients still connect securely. (0 = RDP, 1 = Negotiate, 2 = TLS)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+                             -Name "SecurityLayer" -Value 2 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "MinEncryptionLevel" -Value 3 -Force
 
           # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-         
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+
           # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -Profile Any | Out-Null
 
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 5
+
+          # Confirm the listener is back up
+          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue |
+            Format-Table -AutoSize
 
       - name: Create RDP User with Fixed Password
         run: |
@@ -35,12 +53,14 @@ jobs:
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          } else {
+              Set-LocalUser -Name "RDP" -Password $securePass
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-         
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-         
+
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
@@ -48,37 +68,48 @@ jobs:
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          # "latest" MSI avoids a pinned build going stale on the 2025 image
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-         
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          $p = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+              Write-Error "Tailscale MSI failed with exit code $($p.ExitCode)"
+              exit 1
+          }
           Remove-Item $installerPath -Force
+          Get-Service Tailscale | Format-Table -AutoSize
 
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-         
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "tailscale up failed with exit code $LASTEXITCODE"
+              exit 1
+          }
+
           # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if ($tsIP) { break }
               Start-Sleep -Seconds 5
               $retries++
           }
-         
+
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
+
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-         
+
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
@@ -131,3 +162,4 @@ jobs:
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
+
